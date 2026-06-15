@@ -52,45 +52,6 @@ const DECISION_META: Record<
   escalated: { label: 'Escalated to a human', cls: 'info', icon: '👤', tag: 'Escalated' },
 }
 
-// ── PDF text extraction via runtime-loaded pdf.js (no build dependency) ──
-let pdfjsLoading: Promise<unknown> | null = null
-function loadPdfJs(): Promise<unknown> {
-  if (typeof window === 'undefined') return Promise.reject(new Error('no window'))
-  const w = window as unknown as { pdfjsLib?: unknown }
-  if (w.pdfjsLib) return Promise.resolve(w.pdfjsLib)
-  if (pdfjsLoading) return pdfjsLoading
-  pdfjsLoading = new Promise((resolve, reject) => {
-    const script = document.createElement('script')
-    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'
-    script.onload = () => {
-      const lib = (window as unknown as { pdfjsLib?: { GlobalWorkerOptions: { workerSrc: string } } }).pdfjsLib
-      if (lib) {
-        lib.GlobalWorkerOptions.workerSrc =
-          'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'
-        resolve(lib)
-      } else reject(new Error('PDF reader failed to load'))
-    }
-    script.onerror = () => reject(new Error('PDF reader failed to load'))
-    document.head.appendChild(script)
-  })
-  return pdfjsLoading
-}
-
-async function extractPdfText(file: File): Promise<string> {
-  /* eslint-disable @typescript-eslint/no-explicit-any */
-  const lib: any = await loadPdfJs()
-  const buf = await file.arrayBuffer()
-  const pdf = await lib.getDocument({ data: buf }).promise
-  let out = ''
-  for (let i = 1; i <= pdf.numPages; i++) {
-    const page = await pdf.getPage(i)
-    const content = await page.getTextContent()
-    out += content.items.map((it: any) => it.str).join(' ') + '\n'
-  }
-  return out
-  /* eslint-enable @typescript-eslint/no-explicit-any */
-}
-
 export default function PolicyAssistant() {
   const [question, setQuestion] = useState('')
   const [loading, setLoading] = useState(false)
@@ -98,16 +59,6 @@ export default function PolicyAssistant() {
   const [error, setError] = useState<string | null>(null)
   const [escalated, setEscalated] = useState(false)
   const [audit, setAudit] = useState<AuditRow[]>([])
-
-  // corpus / upload
-  const [namespace, setNamespace] = useState('')
-  const [corpusTitle, setCorpusTitle] = useState<string | null>(null)
-  const [corpusChunks, setCorpusChunks] = useState(0)
-  const [uploadOpen, setUploadOpen] = useState(false)
-  const [pasteText, setPasteText] = useState('')
-  const [fileName, setFileName] = useState('')
-  const [uploading, setUploading] = useState(false)
-  const [uploadError, setUploadError] = useState<string | null>(null)
 
   const logRow = (row: AuditRow) => setAudit((prev) => [row, ...prev].slice(0, 25))
 
@@ -122,7 +73,7 @@ export default function PolicyAssistant() {
       const res = await fetch('/api/ask', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: q, namespace }),
+        body: JSON.stringify({ question: q }),
       })
       const data = await res.json()
       if (!res.ok) {
@@ -159,63 +110,6 @@ export default function PolicyAssistant() {
       confidence: null,
       detail: 'Routed to HR for human review',
     })
-  }
-
-  const handleFile = async (file: File | null) => {
-    if (!file) return
-    setUploadError(null)
-    setFileName(file.name)
-    try {
-      let text = ''
-      if (file.name.toLowerCase().endsWith('.pdf')) {
-        text = await extractPdfText(file)
-      } else {
-        text = await file.text()
-      }
-      setPasteText(text)
-    } catch {
-      setUploadError('Could not read that file. Try pasting the text instead.')
-    }
-  }
-
-  const submitUpload = async () => {
-    const text = pasteText.trim()
-    if (!text || uploading) return
-    setUploading(true)
-    setUploadError(null)
-    try {
-      const title = fileName || 'Your Document'
-      const res = await fetch('/api/upload', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, title }),
-      })
-      const data = await res.json()
-      if (!res.ok) {
-        setUploadError(data.error ?? 'Upload failed')
-        return
-      }
-      setNamespace(data.namespace)
-      setCorpusTitle(data.title)
-      setCorpusChunks(data.chunks)
-      setUploadOpen(false)
-      setResult(null)
-      setError(null)
-      setPasteText('')
-      setFileName('')
-    } catch {
-      setUploadError('Network error during upload')
-    } finally {
-      setUploading(false)
-    }
-  }
-
-  const resetCorpus = () => {
-    setNamespace('')
-    setCorpusTitle(null)
-    setCorpusChunks(0)
-    setResult(null)
-    setError(null)
   }
 
   const g = result?.governed
@@ -255,76 +149,9 @@ export default function PolicyAssistant() {
         </div>
       </div>
 
-      {/* Corpus + upload control */}
-      <div className="corpus-bar">
-        <div className="corpus-info">
-          Answering from:
-          {corpusTitle ? (
-            <>
-              <span className="corpus-tag">📄 {corpusTitle}</span>
-              <span style={{ marginLeft: 8 }}>{corpusChunks} chunks indexed</span>
-            </>
-          ) : (
-            <span className="corpus-tag">Demo HR policies (4 docs)</span>
-          )}
-        </div>
-        <div style={{ display: 'flex', gap: 8 }}>
-          {corpusTitle && (
-            <button className="btn-ghost" onClick={resetCorpus} disabled={loading}>
-              Reset to demo
-            </button>
-          )}
-          <button
-            className="btn-ghost"
-            onClick={() => setUploadOpen((v) => !v)}
-            disabled={loading}
-          >
-            {uploadOpen ? 'Cancel' : '⬆ Test your own document'}
-          </button>
-        </div>
-      </div>
-
-      {/* Upload panel */}
-      {uploadOpen && (
-        <div className="upload-panel">
-          <div className="upload-title">Test it on your own document</div>
-          <div className="upload-hint">
-            Paste any policy text, or upload a .txt / .md / .pdf. It&apos;s indexed into a private,
-            session-only namespace — not mixed with anyone else&apos;s. Then ask it questions.
-          </div>
-          <textarea
-            className="upload-textarea"
-            value={pasteText}
-            onChange={(e) => setPasteText(e.target.value)}
-            placeholder="Paste your policy, handbook, or any document text here…"
-          />
-          <div className="upload-actions">
-            <label className="file-label">
-              📎 Choose file
-              <input
-                type="file"
-                accept=".txt,.md,.pdf"
-                style={{ display: 'none' }}
-                onChange={(e) => handleFile(e.target.files?.[0] ?? null)}
-              />
-            </label>
-            {fileName && <span className="file-name">{fileName}</span>}
-            <button
-              className="btn-primary"
-              style={{ marginLeft: 'auto' }}
-              onClick={submitUpload}
-              disabled={uploading || !pasteText.trim()}
-            >
-              {uploading ? 'Indexing…' : 'Index & use this document'}
-            </button>
-          </div>
-          {uploadError && <div className="upload-error">{uploadError}</div>}
-        </div>
-      )}
-
       {/* Question box */}
       <div className="search-box">
-        <label className="search-label">Ask a question</label>
+        <label className="search-label">Ask a question about company policies</label>
         <div className="search-input-wrapper">
           <input
             type="text"
@@ -342,15 +169,13 @@ export default function PolicyAssistant() {
             {loading ? '…' : 'Ask'}
           </button>
         </div>
-        {!corpusTitle && (
-          <div className="sample-questions">
-            {SAMPLE_QUESTIONS.map((q) => (
-              <button key={q} className="sample-q" onClick={() => { setQuestion(q); runQuery(q) }} disabled={loading}>
-                {q}
-              </button>
-            ))}
-          </div>
-        )}
+        <div className="sample-questions">
+          {SAMPLE_QUESTIONS.map((q) => (
+            <button key={q} className="sample-q" onClick={() => { setQuestion(q); runQuery(q) }} disabled={loading}>
+              {q}
+            </button>
+          ))}
+        </div>
       </div>
 
       {error && <div className="error-box"><strong>Error:</strong> {error}</div>}
@@ -383,7 +208,7 @@ export default function PolicyAssistant() {
               <>
                 <div className="refusal-explain">
                   {g.decision === 'no_match' ? (
-                    <>Nothing relevant was found in {corpusTitle ? 'your document' : 'the policy documents'} (top similarity {Math.round(g.retrievalConfidence * 100)}%). The system will not answer from thin air.</>
+                    <>Nothing relevant was found in the policy documents (top similarity {Math.round(g.retrievalConfidence * 100)}%). The system will not answer from thin air.</>
                   ) : (
                     <>The closest match was <strong>{g.sources[0]?.title}</strong> ({Math.round(g.retrievalConfidence * 100)}% similar) — but it doesn&apos;t actually contain this answer. A similarity score alone would have missed that.</>
                   )}
