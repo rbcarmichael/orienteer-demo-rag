@@ -26,7 +26,9 @@ function getIp(req: NextRequest): string {
   )
 }
 
-// Cache the Pinecone index host — resolved once per serverless instance
+// Below this similarity, nothing relevant was retrieved at all — skip the grounded attempt.
+const RETRIEVAL_FLOOR = 0.15
+
 let cachedIndexHost: string | null = null
 
 async function getPineconeHost(apiKey: string, indexName: string): Promise<string> {
@@ -52,7 +54,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Rate limit exceeded' }, { status: 429 })
   }
 
-  let body: { question?: string }
+  let body: { question?: string; namespace?: string }
   try {
     body = await req.json()
   } catch {
@@ -60,8 +62,12 @@ export async function POST(req: NextRequest) {
   }
 
   const question = body.question?.trim()
+  const namespace = body.namespace?.trim() || ''
   if (!question) {
     return NextResponse.json({ error: 'Missing question' }, { status: 400 })
+  }
+  if (question.length > 500) {
+    return NextResponse.json({ error: 'Question too long' }, { status: 400 })
   }
 
   const openaiKey = process.env.OPENAI_API_KEY
@@ -78,22 +84,41 @@ export async function POST(req: NextRequest) {
   try {
     const openai = new OpenAI({ apiKey: openaiKey })
 
-    // 1. Embed the question
+    // --- Ungoverned answer: a normal assistant, no documents, runs in parallel ---
+    const ungovernedPromise = openai.chat.completions
+      .create({
+        model: 'gpt-4o-mini',
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You are a helpful corporate assistant. Answer the employee question directly and confidently in 2-4 sentences, as a typical AI chatbot would.',
+          },
+          { role: 'user', content: question },
+        ],
+        temperature: 0.6,
+      })
+      .then((c) => c.choices[0]?.message?.content?.trim() ?? 'No answer.')
+
+    // --- Retrieval ---
     const embRes = await openai.embeddings.create({
       model: 'text-embedding-3-small',
       input: question,
     })
     const vector = embRes.data[0].embedding
 
-    // 2. Query Pinecone
     const host = await getPineconeHost(pineconeKey, indexName)
+    const queryBody: Record<string, unknown> = {
+      topK: 3,
+      vector,
+      includeMetadata: true,
+    }
+    if (namespace) queryBody.namespace = namespace
+
     const queryRes = await fetch(`https://${host}/query`, {
       method: 'POST',
-      headers: {
-        'Api-Key': pineconeKey,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ topK: 3, vector, includeMetadata: true }),
+      headers: { 'Api-Key': pineconeKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify(queryBody),
     })
     if (!queryRes.ok) throw new Error(`Pinecone query failed (${queryRes.status})`)
 
@@ -101,35 +126,101 @@ export async function POST(req: NextRequest) {
     const matches = queryData.matches ?? []
 
     const sources = matches.map((m) => ({
-      title: (m.metadata?.title as string) ?? 'Policy Document',
+      title: (m.metadata?.title as string) ?? 'Document',
       text: ((m.metadata?.text as string) ?? '').slice(0, 500),
       relevance: m.score ?? 0,
     }))
 
-    // 3. Generate answer with retrieved context
-    const contextText = sources
-      .map((s) => `[${s.title}]\n${s.text}`)
-      .join('\n\n')
+    const topScore = sources.length ? sources[0].relevance : 0
+    const corpus = namespace ? 'uploaded' : 'demo'
 
-    const completion = await openai.chat.completions.create({
+    // --- No relevant documents at all ---
+    if (topScore < RETRIEVAL_FLOOR) {
+      const ungoverned = await ungovernedPromise
+      return NextResponse.json({
+        question,
+        ungoverned: { answer: ungoverned },
+        governed: {
+          decision: 'no_match',
+          grounded: false,
+          retrievalConfidence: topScore,
+          answer: '',
+          citation: '',
+          sources,
+          corpus,
+        },
+      })
+    }
+
+    // --- Grounded attempt: model must certify the answer is supported by the context ---
+    const contextText = sources.map((s) => `[${s.title}]\n${s.text}`).join('\n\n')
+
+    const groundedRes = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
         {
           role: 'system',
           content:
-            'You are a helpful HR assistant. Answer questions based ONLY on the provided policy context. Always cite which policy document your answer comes from. If the answer is not in the context, say "I don\'t have that information in the policy documents." Be concise and clear.',
+            'You are a careful policy assistant. You are given context passages from internal documents. ' +
+            'Decide whether the context EXPLICITLY answers the question. ' +
+            'Return strict JSON: {"grounded": boolean, "answer": string, "citation": string}. ' +
+            'Set "grounded" true ONLY if the answer is directly stated in the context — not merely related or plausible. ' +
+            'If grounded, "answer" is the answer drawn solely from the context and "citation" names the source document (and section if visible). ' +
+            'If the context does not actually contain the answer, set "grounded" false, "answer" to an empty string, and "citation" to an empty string. Do not use outside knowledge.',
         },
         {
           role: 'user',
           content: `Context:\n${contextText}\n\nQuestion: ${question}`,
         },
       ],
-      temperature: 0.3,
+      temperature: 0,
+      response_format: { type: 'json_object' },
     })
 
-    const answer = completion.choices[0]?.message?.content ?? 'Unable to generate an answer.'
+    let grounded = false
+    let answer = ''
+    let citation = ''
+    try {
+      const parsed = JSON.parse(groundedRes.choices[0]?.message?.content ?? '{}')
+      grounded = parsed.grounded === true
+      answer = typeof parsed.answer === 'string' ? parsed.answer : ''
+      citation = typeof parsed.citation === 'string' ? parsed.citation : ''
+    } catch {
+      grounded = false
+    }
 
-    return NextResponse.json({ answer, sources })
+    const ungoverned = await ungovernedPromise
+
+    if (grounded && answer) {
+      return NextResponse.json({
+        question,
+        ungoverned: { answer: ungoverned },
+        governed: {
+          decision: 'answered',
+          grounded: true,
+          retrievalConfidence: topScore,
+          answer,
+          citation,
+          sources,
+          corpus,
+        },
+      })
+    }
+
+    // Retrieved related text, but the answer isn't actually there.
+    return NextResponse.json({
+      question,
+      ungoverned: { answer: ungoverned },
+      governed: {
+        decision: 'not_grounded',
+        grounded: false,
+        retrievalConfidence: topScore,
+        answer: '',
+        citation: '',
+        sources,
+        corpus,
+      },
+    })
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Internal server error'
     return NextResponse.json({ error: message }, { status: 500 })
